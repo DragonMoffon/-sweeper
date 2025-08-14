@@ -1,186 +1,243 @@
 from uuid import uuid4
+from enum import IntEnum
 import random
 
 import arcade
 import pyglet
 
-import cProfile
-from time import time_ns
-
 CHUNK_SIZE = 32
 SQUARE_SIZE = 32
 CHUNK_TOTAL_SIZE = CHUNK_SIZE * SQUARE_SIZE
 
-class _Context:
+class SpritePool:
 
-    def __init__(self):
-        self._seed: str | None = None
-        self._seed_hash: int | None = None
-        self._tile_textures: dict[str, arcade.Texture] = {}
-        self._chunk_renderer: arcade.SpriteList = arcade.SpriteList(capacity = 9 * CHUNK_SIZE * CHUNK_SIZE)
+    def __init__(self, count: int, default: arcade.Texture):
+        self._count: int = count
+        self._used: int = 0
+        self._sprites: arcade.SpriteList = arcade.SpriteList(capacity=count)
+        self._sprites.extend((arcade.BasicSprite(default, visible=False) for sprite in range(count)))
+        
+    @property
+    def is_full(self):
+        return self._used == self._count
 
-    def get_seed_source(self) -> str:
-        if self._seed is None:
-            raise ValueError('Seed has not been set.')
-        return self._seed
+    @property
+    def is_empty(self):
+        return self._used == 0
 
-    def get_seed(self) -> int:
-        if self._seed is None:
-            raise ValueError('Seed has not been set.')
-        return self._seed_hash
+    def get(self):
+        if self.is_full:
+            raise IndexError("No more sprites available to free")
 
-    def set_seed(self, seed: str) -> None:
-        self._seed = seed
-        self._seed_hash = hash(seed)
+        sprite = self._sprites[self._used]
+        sprite.visible = True
+        self._used += 1
+        return sprite
 
-    def load_spritesheet(self, path: str):
-        sheet = arcade.SpriteSheet(path)
-        self._tile_textures['grass'] = sheet.get_texture(arcade.LBWH(SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['flag'] = sheet.get_texture(arcade.LBWH(2*SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['0'] = sheet.get_texture(arcade.LBWH(0, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['1'] = sheet.get_texture(arcade.LBWH(3*SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['2'] = sheet.get_texture(arcade.LBWH(4*SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['3'] = sheet.get_texture(arcade.LBWH(5*SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['4'] = sheet.get_texture(arcade.LBWH(6*SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['5'] = sheet.get_texture(arcade.LBWH(7*SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['6'] = sheet.get_texture(arcade.LBWH(8*SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['7'] = sheet.get_texture(arcade.LBWH(9*SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
-        self._tile_textures['8'] = sheet.get_texture(arcade.LBWH(10*SQUARE_SIZE, 0, SQUARE_SIZE, SQUARE_SIZE))
+    def free(self, sprite: arcade.BasicSprite):
+        if self.is_empty:
+            raise IndexError("There are no sprites in use")
 
-    def get_texture(self, name: str):
-        return self._tile_textures[name]
+        idx = self._sprites.index(sprite)
+        if idx >= self._used:
+            raise IndexError("attempting to free already free sprite")
+        self._used -= 1
+        self._sprites.swap(idx, self._used)
+        sprite.visible = False
 
-    def show_sprites(self, sprites: list[arcade.Sprite]):
-        self._chunk_renderer.extend(sprites)
+    def draw(self):
+        self._sprites.draw(pixelated=True)
 
-    def hide_sprites(self):
-        self._chunk_renderer.clear()
 
-    def draw_sprites(self):
-        self._chunk_renderer.draw(pixelated=True)
-
-ctx = _Context()
-
+class Tile(IntEnum):
+    empty = 0
+    bomb = 1
+    shown = 2
+    shown_bomb = 3
+    flag = 4 
+    flag_bomb = 5
 
 class Chunk:
 
-    def __init__(self, x: int, y: int, size: int, square: int, mine_density: float):
-        self.x: int = x
-        self.y: int = y
+    def __init__(self, pos: tuple[int, int], size: int, square: int, mine_density: float, seed: str):
+        self.x: int = pos[0]
+        self.y: int = pos[1]
         self.size: int = size
         self.density: float = mine_density
         self.square_size: int = square
         self.total_px_size: int = size * square
+        self.seed: str = seed
         
-        self._has_generated: bool = False
-        self._has_counted: bool = False
-        self._is_shown: bool = False
-
-        self._bombs: list[list[bool]] = []
-        self._flags: list[list[bool]] = []
-        self._shown: list[list[bool]] = []
-        self._count: list[list[int]] = []
-        self._sprites: list[arcade.Sprite] = []
-
-    def get_sprites(self):
-        if not self._sprites:
-            chunk_x = self.x * self.total_px_size
-            chunk_y = self.y * self.total_px_size
-            sq_sz = self.square_size
-            self._sprites = [None] * (self.size*self.size)
-            for x in range(self.size):
-                for y in range(self.size):
-                    idx = x * self.size + y
-                    self._sprites[idx] = arcade.Sprite(ctx.get_texture("grass"), chunk_x + (x + 0.5) * sq_sz, chunk_y + (y + 0.5) * sq_sz)
-        return self._sprites
-
-    def place_bombs(self):
-        self._bombs: list[list[bool]] = [[False] * size for _ in range(size)]
-        self._flags: list[list[bool]] = [[False] * size for _ in range(size)]
-        self._shown: list[list[bool]] = [[False] * size for _ in range(size)]
-        self._count: list[list[int]] = [[0] * size for _ in range(size)]
-        
-        random.seed(ctx.get_seed())
-        safe_squares = [(x, y) for x in range(size) for y in range(size)]
-        for _ in range(self.count):
-            bomb_idx = random.randrange(0, len(safe_squares))
-            bomb = safe_squares.pop(bomb_idx)
-            self._bombs[bomb[0]][bomb[1]] = True
-
-        self._has_generated: bool = True
-
-    def count_bombs(self):
-        pass
+        self._tiles: list[list[Tile]] = None
 
     @property
-    def count(self) -> int:
+    def is_generated(self) -> bool:
+        return self.tiles is not Nonei
+        
+    @property
+    def bomb_count(self) -> int:
         return int(self.size * self.size * self.density)
                     
+    def get_tiles(self) -> list[list[Tile]]:
+        if self._tiles is not None:
+            return self._tiles
 
+        self._tiles = [[Tile.empty] * self.size for _ in range(self.size)]
+        free_indices = [(x, y) for x in range(self.size) for y in range(self.size)]
+        random.seed(hash(self.seed))
+        for bomb_location in random.sample(free_indices, self.bomb_count):
+            self._tiles[bomb_location[0]][bomb_location[1]] = Tile.bomb
+
+        return self._tiles
+
+    def to_local_coord(self, pos):
+        x_ = pos[0] - self.size * self.x
+        y_ = pos[1] - self.size * self.y
+        return (x_, y_)
+
+    def to_global_coord(self, pos):
+        x_ = pos[0] + self.size * self.x
+        y_ = pos[1] + self.size * self.y
+        return (x_, y_)
 
 class Application(arcade.Window):
 
-    def __init__(self):
+    def __init__(self, seed: str):
         arcade.Window.__init__(self, 800, 800, "∞-Sweeper", vsync=False)
-        ctx.load_spritesheet('./sweep/tiles.png')
+        self.seed = seed
         self.frame_camera = arcade.Camera2D()
         self.game_camera = arcade.Camera2D(arcade.LBWH(30, 30, 740, 740))
+        
+        textures = arcade.load_spritesheet("sweep/tiles.png").get_texture_grid((SQUARE_SIZE, SQUARE_SIZE), 12, 12)
+        self.textures: dict[str, arcade.Texture] = {name: tex for name, tex in zip("efb012345678", textures)}
+
         self.chunks: dict[tuple[int, int], Chunk] = {}
-        self.shown_chunks: tuple[tuple[int, int], ...] = ()
+        self.shown_chunks: dict[tuple[int, int], tuple(arcade.Sprite)] = {}
+        self.last_chunks: tuple[tuple[int, int], ...] = ((0, 0),)
+        self.sprites: SpritePool = SpritePool(9 * CHUNK_SIZE * CHUNK_SIZE, self.textures['e'])
 
-    def get_chunk(self, x: int, y: int):
-        if (x, y) not in self.chunks:
-            self.chunks[x, y] = Chunk(x, y, CHUNK_SIZE, SQUARE_SIZE, 0.2)
+        self._chunk = self.get_chunk((0, 0))
+        self.show_chunk((0, 0))
 
-        return self.chunks[x, y]
-
-    def _dispatch_frame(self, delta_time: float):
-        s = time_ns()
-        super()._dispatch_frame(delta_time)
-        e = time_ns()
-        print(f'frame_time: {s*1e-9}s -> {e*1e-9}s; {(e-s)*1e-6}ms')
-
-    def _dispatch_updates(self, delta_time: float):
-        s = time_ns()
-        super()._dispatch_updates(delta_time)
-        e = time_ns()
-        print(f'update time: {s*1e-9}s -> {e*1e-9}s; {(e-s)*1e-6}ms')
+    def tile_texture(self, tile, coord):
+        if tile == Tile.empty: # Empty
+            return self.textures['e']
+        elif tile == Tile.bomb: # Bomb
+            return self.textures['b']
+        elif tile == Tile.shown: # Shown
+            count = self.get_tile_count(coord)
+            return self.textures[str(count)]
+        elif tile & 0b100: # flag
+            return self.textures['f']
 
 
-    def on_update(self, delta_time: float):
-        print(1/delta_time)
+    def get_chunk(self, pos):
+        if pos not in self.chunks:
+            self.chunks[pos] = Chunk(pos, CHUNK_SIZE, SQUARE_SIZE, 0.25, self.seed)
+
+        return self.chunks[pos]
+    
+    def hide_chunk(self, chunk: tuple[int, int]):
+        if chunk not in self.shown_chunks:
+            return
+
+        sprites = self.shown_chunks.pop(chunk)
+        for sprite in sprites:
+            self.sprites.free(sprite)
+
+    def show_chunk(self, chunk: tuple[int, int]):
+        if chunk in self.shown_chunks or len(self.shown_chunks) >= 9:
+            return
+
+        chunk_data = self.get_chunk(chunk)
+        tiles = chunk_data.get_tiles()
+        sprites = []
+        for x, column in enumerate(tiles):
+            for y, tile in enumerate(column):
+                coord = chunk_data.to_global_coord((x, y))
+                sprite = self.sprites.get()
+                sprite.position = (coord[0] + 0.5) * SQUARE_SIZE, (coord[1] + 0.5) * SQUARE_SIZE
+                sprite.texture = self.tile_texture(tile, coord)
+                sprites.append(sprite)
+        self.shown_chunks[chunk] = tuple(sprites)
+
+    def change_chunk(self, old: tuple[int, int], new: tuple[int, int]):
+        if new in self.shown_chunks:
+            return
+        if old not in self.shown_chunks:
+            self.show_chunk(new)
+            return
+        
+        sprites = self.shown_chunks.pop(old)
+        chunk = self.get_chunk(new)
+        tiles = chunk.get_tiles()
+        for x, column in enumerate(tiles):
+            for y, tile in enumerate(column):
+                idx = x * chunk.size + y
+                coord = chunk.to_global_coord((x, y))
+                sprite = sprites[idx]
+                sprite.position = (coord[0] + 0.5) * SQUARE_SIZE, (coord[1] + 0.5) * SQUARE_SIZE
+                sprite.texture = self.tile_texture(tile, coord)
+
+    def get_tile(self, pos):
+        cx = pos[0] // CHUNK_SIZE
+        cy = pos[1] // CHUNK_SIZE
+        chunk = self.get_chunk((cx, cy))
+        pos = chunk.to_local_coord(pos)
+        return chunk.get_tiles()[pos[0]][pos[1]]
+
+    def get_tile_count(self, pos):
+        count = 0
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                tile = self.get_tile((pos[0]+dx, pos[1]+dy))
+                if tile & 0b001:
+                    count += 1
+        return count
+
+    def find_shown_chunks(self):
+        l, b = self.game_camera.bottom_left
+        r, t = self.game_camera.top_right
+        cl, cr, cb, ct = l // CHUNK_TOTAL_SIZE, r // CHUNK_TOTAL_SIZE, b // CHUNK_TOTAL_SIZE, t // CHUNK_TOTAL_SIZE
+        return tuple((x, y) for x in range(int(cl), int(cr) + 1) for y in range(int(cb), int(ct) + 1))
+
+    def show_chunks(self, chunks: tuple[tuple[int, int], ...]):
+        previous = self.shown_chunks
+        old = [chunk for chunk in previous if chunk not in chunks]
+        new = [chunk for chunk in chunks if chunk not in previous]
+       
+        if not old and not new:
+            return
+        
+        for chunk in old:
+            if not new:
+                self.hide_chunk(chunk)
+            else:
+                self.change_chunk(chunk, new.pop(-1))
+        
+        for chunk in new:
+            self.show_chunk(chunk)
+
 
     def on_draw(self):
-        s = time_ns()
         self.clear()
         with self.frame_camera.activate():
             arcade.draw_text(
                 f"chunks created: {len(self.chunks)}", 5, 5, font_name="monofur"
             )
             arcade.draw_text(
-                f"seed: {ctx.get_seed_source()}", self.width - 5, 5, font_name="monofur", anchor_x="right"
+                f"fps: {1/self.delta_time:.3f}", self.width/2, 5, font_name="monofur", anchor_x="center"
+            )
+            arcade.draw_text(
+                f"seed: {self.seed}", self.width - 5, 5, font_name="monofur", anchor_x="right"
             )
 
         with self.game_camera.activate():
-            l, b = self.game_camera.bottom_left
-            r, t = self.game_camera.top_right
-
-            l, r = int(l // CHUNK_TOTAL_SIZE), int(r // CHUNK_TOTAL_SIZE)
-            b, t = int(b // CHUNK_TOTAL_SIZE), int(t // CHUNK_TOTAL_SIZE)
-            chunks = tuple((x, y) for x in range(l, r+1) for y in range(b, t+1))
-            if chunks != self.shown_chunks:
-                print('renew')
-                self.shown_chunks = chunks
-                ctx.hide_sprites()
-                for coord in chunks:
-                    chunk = self.get_chunk(coord[0], coord[1])
-                    ctx.show_sprites(chunk.get_sprites())
-            s2 = time_ns()
-            ctx.draw_sprites()
-            e2 = time_ns()
-            print(f'chunk time: {s2*1e-9}s -> {e2*1e-9}s; {(e2-s2) * 1e-6}ms')
-        e = time_ns()
-        print(f'draw_time: {s*1e-9}s -> {e*1e-9}s; {(e - s) * 1e-6}ms')
+            chunks = self.find_shown_chunks()
+            if chunks != self.last_chunks:
+                self.last_chunks = chunks
+                self.show_chunks(chunks)
+            self.sprites.draw()
 
     def on_mouse_drag(self, x, y, dx, dy, symbol, modifier):
         pos = self.game_camera.position
@@ -197,15 +254,11 @@ def main():
     seed = input("enter game seed (leave blank for random): ")
     if not seed:
         seed = uuid4().hex
-    ctx.set_seed(hash(seed))
 
-    win = Application()
+    win = Application(seed)
     win.run()
 
 
 if __name__ == "__main__":
-    with cProfile.Profile() as pr:
-        main()
-
-        # pr.print_stats('cumulative')
+    main()
 
