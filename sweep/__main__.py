@@ -91,13 +91,13 @@ class Chunk:
         return self._tiles
 
     def to_local_coord(self, pos):
-        x_ = pos[0] - self.size * self.x
-        y_ = pos[1] - self.size * self.y
+        x_ = int(pos[0] - self.size * self.x)
+        y_ = int(pos[1] - self.size * self.y)
         return (x_, y_)
 
     def to_global_coord(self, pos):
-        x_ = pos[0] + self.size * self.x
-        y_ = pos[1] + self.size * self.y
+        x_ = int(pos[0] + self.size * self.x)
+        y_ = int(pos[1] + self.size * self.y)
         return (x_, y_)
 
 class Application(arcade.Window):
@@ -116,7 +116,8 @@ class Application(arcade.Window):
         self.last_chunks: tuple[tuple[int, int], ...] = ((0, 0),)
         self.sprites: SpritePool = SpritePool(9 * CHUNK_SIZE * CHUNK_SIZE, self.textures['e'])
 
-        self._chunk = self.get_chunk((0, 0))
+        self.dragged: bool = False
+
         self.show_chunk((0, 0))
 
     def tile_texture(self, tile, coord):
@@ -129,7 +130,6 @@ class Application(arcade.Window):
             return self.textures[str(count)]
         elif tile & 0b100: # flag
             return self.textures['f']
-
 
     def get_chunk(self, pos):
         if pos not in self.chunks:
@@ -195,6 +195,26 @@ class Application(arcade.Window):
                     count += 1
         return count
 
+    def toggle_flag(self, pos):
+        cx = pos[0] // CHUNK_SIZE
+        cy = pos[1] // CHUNK_SIZE
+        chunk = self.get_chunk((cx, cy))
+        tiles = chunk.get_tiles()
+        pos_ = chunk.to_local_coord(pos)
+        tile = Tile(tiles[pos_[0]][pos_[1]] ^ 0b100)
+        tiles[pos_[0]][pos_[1]] = tile
+        if (cx, cy) not in self.shown_chunks:
+            return
+        idx = pos_[0] * chunk.size + pos_[1]
+        sprite = self.shown_chunks[cx, cy][idx].texture = self.tile_texture(tile, pos)
+
+    def show_tile(self, pos):
+        cx = pos[0] // CHUNK_SIZE
+        cy = pos[1] // CHUNK_SIZE
+        chunk = self.get_chunk((cx, cy))
+        tiles = chunk.get_tiles()
+        tile = chunk
+        
     def find_shown_chunks(self):
         l, b = self.game_camera.bottom_left
         r, t = self.game_camera.top_right
@@ -240,6 +260,7 @@ class Application(arcade.Window):
             self.sprites.draw()
 
     def on_mouse_drag(self, x, y, dx, dy, symbol, modifier):
+        self.dragged = True
         pos = self.game_camera.position
         zoom = self.game_camera.zoom
         self.game_camera.position = pos[0] - dx / zoom, pos[1] - dy / zoom
@@ -249,6 +270,11 @@ class Application(arcade.Window):
             4.0, max(0.5, self.game_camera.zoom - scroll_y * 0.1)
         )
 
+    def on_mouse_release(self, x, y, symbol, modifier):
+        if not self.dragged:
+            pos = self.game_camera.unproject((x, y)) // SQUARE_SIZE
+            self.toggle_flag((int(pos.x), int(pos.y)))
+        self.dragged = False
 
 def main():
     seed = input("enter game seed (leave blank for random): ")
